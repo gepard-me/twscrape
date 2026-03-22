@@ -48,7 +48,7 @@ For optimal performance and to avoid IP-based restrictions, we also recommend us
 
 ```python
 import asyncio
-from twscrape import API, gather
+from twscrape import API, enable_logging, gather
 from twscrape.logger import set_log_level
 
 async def main():
@@ -113,6 +113,9 @@ async def main():
     async for rep in api.search_raw("elon musk"):
         print(rep.status_code, rep.json())  # rep is `httpx.Response` object
 
+    # library logs are disabled by default; opt in when you want them
+    enable_logging()
+
     # change log level, default info
     set_log_level("DEBUG")
 
@@ -124,6 +127,44 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+### Logging with existing Loguru apps
+
+`twscrape` disables its own logs by default because it is a library.
+
+If your application already configures [Loguru](https://github.com/Delgan/loguru), prefer enabling the `twscrape` namespace instead of calling `enable_logging()`. This lets `twscrape` reuse your application's existing sinks and formatting.
+
+```python
+from loguru import logger
+from twscrape.logger import set_log_level
+
+logger.add("app.log", rotation="100 MB")
+logger.enable("twscrape")
+
+# twscrape-specific minimum level
+set_log_level("DEBUG")
+```
+
+If you want `twscrape` logs to go to a dedicated file while keeping the rest of your app unchanged, add a sink with a filter for the `twscrape` module:
+
+```python
+from loguru import logger
+from twscrape.logger import set_log_level
+
+logger.enable("twscrape")
+set_log_level("INFO")
+
+logger.add(
+    "twscrape.log",
+    filter=lambda record: record["name"].startswith("twscrape"),
+    level="TRACE",
+)
+```
+
+Notes:
+- Use `enable_logging()` only when you want `twscrape` to quickly add its own stderr sink.
+- Use `logger.enable("twscrape")` when your app already configured Loguru sinks.
+- Use `set_log_level("ERROR")`, `set_log_level("INFO")`, or `set_log_level("DEBUG")` to change only `twscrape`'s verbosity without affecting the rest of your app.
 
 ### Stoping iteration with break
 

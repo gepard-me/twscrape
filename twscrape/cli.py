@@ -11,7 +11,7 @@ import httpx
 
 from .api import API, AccountsPool
 from .db import get_sqlite_version
-from .logger import logger, set_log_level
+from .logger import enable_logging, logger, set_log_level
 from .login import LoginConfig
 from .models import Tweet, User
 from .utils import print_table
@@ -140,6 +140,8 @@ def custom_help(p):
 
 
 def run():
+    enable_logging()
+
     p = argparse.ArgumentParser(add_help=False, formatter_class=CustomHelpFormatter)
     p.add_argument("--db", default="accounts.db", help="Accounts database file")
     p.add_argument("--debug", action="store_true", help="Enable debug mode")
