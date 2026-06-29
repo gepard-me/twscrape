@@ -4,11 +4,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import TypedDict
 
-from fake_useragent import UserAgent
-from httpx import HTTPStatusError
-
 from .account import Account
 from .db import execute, fetchall, fetchone
+from .http import HttpStatusError
 from .logger import logger
 from .login import LoginConfig, login
 from .utils import get_env_bool, parse_cookies, utc
@@ -50,12 +48,12 @@ class AccountsPool:
         line_delim = guess_delim(line_format)
         tokens = line_format.split(line_delim)
 
-        required = set(["username", "password", "email", "email_password"])
+        required = {"username", "password", "email", "email_password"}
         if not required.issubset(tokens):
             raise ValueError(f"Invalid line format: {line_format}")
 
         accounts = []
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             lines = f.read().split("\n")
             lines = [x.strip() for x in lines if x.strip()]
 
@@ -93,7 +91,7 @@ class AccountsPool:
             password=password,
             email=email,
             email_password=email_password,
-            user_agent=user_agent or UserAgent().safari,
+            user_agent=user_agent or "@chrome",
             active=False,
             locks={},
             stats={},
@@ -108,6 +106,16 @@ class AccountsPool:
 
         await self.save(account)
         logger.info(f"Account {username} added successfully (active={account.active})")
+
+    async def add_account_cookies(self, username: str, cookies: str):
+        existing = await self.get_account(username)
+        if existing is not None:
+            logger.warning(f"Account {username} already exists (active={existing.active})")
+            return
+
+        await self.add_account(
+            username=username, password="_", email="_", email_password="_", cookies=cookies
+        )
 
     async def delete_accounts(self, usernames: str | list[str]):
         usernames = usernames if isinstance(usernames, list) else [usernames]
@@ -157,7 +165,7 @@ class AccountsPool:
             await login(account, cfg=self._login_config)
             logger.info(f"Logged in to {account.username} successfully")
             return True
-        except HTTPStatusError as e:
+        except HttpStatusError as e:
             rep = e.response
             logger.error(f"Failed to login '{account.username}': {rep.status_code} - {rep.text}")
             return False
@@ -200,7 +208,7 @@ class AccountsPool:
             error_msg = NULL,
             headers = json_object(),
             cookies = json_object(),
-            user_agent = "{UserAgent().safari}"
+            user_agent = "@chrome"
         WHERE username IN ({",".join([f'"{x}"' for x in usernames])})
         """
 

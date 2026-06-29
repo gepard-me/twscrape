@@ -4,10 +4,9 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-import httpx
-from httpx import AsyncClient, Response
-
+from . import telemetry
 from .accounts_pool import Account, AccountsPool
+from .http import ConnectError, HttpClient, HttpMethod, HttpStatusError, NetworkError, Response
 from .logger import logger
 from .utils import utc
 from .xclid import XClIdGen
@@ -36,17 +35,20 @@ class XClIdGenStore:
                 clid_gen = await XClIdGen.create()
                 cls.items[username] = clid_gen
                 return clid_gen
-            except httpx.HTTPStatusError:
+            except Exception as e:
                 tries += 1
+                logger.warning(
+                    f"XClIdGen creation attempt {tries}/3 failed: {type(e).__name__}: {e}"
+                )
                 await asyncio.sleep(1)
 
         raise AbortReqError(
-            "Faield to create XClIdGen. See: https://github.com/vladkens/twscrape/issues/248"
+            "Failed to create XClIdGen. See: https://github.com/vladkens/twscrape/issues/248"
         )
 
 
 class Ctx:
-    def __init__(self, acc: Account, clt: AsyncClient):
+    def __init__(self, acc: Account, clt: HttpClient):
         self.req_count = 0
         self.acc = acc
         self.clt = clt
@@ -54,7 +56,7 @@ class Ctx:
     async def aclose(self):
         await self.clt.aclose()
 
-    async def req(self, method: str, url: str, params: ReqParams = None) -> Response:
+    async def req(self, method: HttpMethod, url: str, params: ReqParams = None) -> Response:
         # if code 404 on first try then generate new x-client-transaction-id and retry
         # https://github.com/vladkens/twscrape/issues/248
         path = urlparse(url).path or "/"
@@ -167,6 +169,11 @@ class QueueClient:
         if self.debug:
             dump_rep(rep)
 
+        if "text/html" in rep.headers.get("content-type", "") and rep.status_code >= 400:
+            src = "Cloudflare" if "cf-ray" in rep.headers else "HTML"
+            logger.warning(f"Blocked by {src}: {rep.status_code} - {req_id(rep)}")
+            raise AbortReqError()
+
         try:
             res = rep.json()
         except json.JSONDecodeError:
@@ -178,7 +185,7 @@ class QueueClient:
 
         err_msg = "OK"
         if "errors" in res:
-            err_msg = set([f"({x.get('code', -1)}) {x['message']}" for x in res["errors"]])
+            err_msg = {f"({x.get('code', -1)}) {x['message']}" for x in res["errors"]}
             err_msg = "; ".join(list(err_msg))
 
         log_msg = f"{rep.status_code:3d} - {req_id(rep)} - {err_msg}"
@@ -241,7 +248,7 @@ class QueueClient:
 
         try:
             rep.raise_for_status()
-        except httpx.HTTPStatusError:
+        except HttpStatusError:
             logger.error(f"Unhandled API response code: {log_msg}")
             await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
             raise HandledError()
@@ -249,7 +256,7 @@ class QueueClient:
     async def get(self, url: str, params: ReqParams = None) -> Response | None:
         return await self.req("GET", url, params=params)
 
-    async def req(self, method: str, url: str, params: ReqParams = None) -> Response | None:
+    async def req(self, method: HttpMethod, url: str, params: ReqParams = None) -> Response | None:
         unknown_retry, connection_retry = 0, 0
 
         while True:
@@ -258,6 +265,17 @@ class QueueClient:
                 return None
 
             try:
+                source = telemetry.current_source()
+                telemetry.capture(
+                    "gql_request",
+                    {
+                        "operation": self.queue,
+                        "http_method": method,
+                        "http_backend": getattr(ctx.clt, "backend", "unknown"),
+                        "source": source,
+                        "$current_url": f"{source}://twscrape/gql/{self.queue}",
+                    },
+                )
                 rep = await ctx.req(method, url, params=params)
                 setattr(rep, "__username", ctx.acc.username)
                 await self._check_rep(rep)
@@ -271,11 +289,11 @@ class QueueClient:
             except HandledError:
                 # retry with new account
                 continue
-            except (httpx.ReadTimeout, httpx.ProxyError):
+            except NetworkError:
                 # http transport failed, just retry with same account
                 continue
-            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
-                # if proxy missconfigured or ???
+            except ConnectError as e:
+                # if proxy misconfigured or host unreachable
                 connection_retry += 1
                 if connection_retry >= 3:
                     raise e

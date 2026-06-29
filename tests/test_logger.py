@@ -1,24 +1,35 @@
 import importlib
 import io
 import sys
+from typing import Any, cast
 
 from loguru import logger as loguru_logger
 
-logger_module = importlib.import_module("twscrape.logger")
+logger_module = cast(Any, importlib.import_module("twscrape.logger"))
 
 
-def _reload_logger_module(monkeypatch, env_value: str | None = None):
+def setup_function():
+    module = cast(Any, sys.modules.get("twscrape.logger", logger_module))
+    if module._SINK_ID is not None:
+        loguru_logger.remove(module._SINK_ID)
+        module._SINK_ID = None
+
+    loguru_logger.remove()
+    loguru_logger.disable("twscrape")
+
+
+def _reload_logger_module(monkeypatch, env_value: str | None = None) -> Any:
     if env_value is None:
         monkeypatch.delenv("TWS_LOG_LEVEL", raising=False)
     else:
         monkeypatch.setenv("TWS_LOG_LEVEL", env_value)
 
-    module = sys.modules.get("twscrape.logger", logger_module)
+    module = cast(Any, sys.modules.get("twscrape.logger", logger_module))
     return importlib.reload(module)
 
 
 def teardown_function():
-    module = sys.modules.get("twscrape.logger", logger_module)
+    module = cast(Any, sys.modules.get("twscrape.logger", logger_module))
 
     if module._SINK_ID is not None:
         loguru_logger.remove(module._SINK_ID)
@@ -28,21 +39,21 @@ def teardown_function():
 
 
 def test_import_does_not_register_sink(monkeypatch):
-    handlers_before = tuple(loguru_logger._core.handlers)
+    handlers_before = tuple(cast(Any, loguru_logger)._core.handlers)
 
     module = _reload_logger_module(monkeypatch)
 
-    assert tuple(loguru_logger._core.handlers) == handlers_before
+    assert tuple(cast(Any, loguru_logger)._core.handlers) == handlers_before
     assert module._SINK_ID is None
 
 
 def test_invalid_env_defaults_to_info_without_registering_sink(monkeypatch):
-    handlers_before = tuple(loguru_logger._core.handlers)
+    handlers_before = tuple(cast(Any, loguru_logger)._core.handlers)
 
     module = _reload_logger_module(monkeypatch, "verbose")
 
     assert module._LOG_LEVEL == "INFO"
-    assert tuple(loguru_logger._core.handlers) == handlers_before
+    assert tuple(cast(Any, loguru_logger)._core.handlers) == handlers_before
     assert module._SINK_ID is None
 
 
@@ -65,8 +76,8 @@ def test_enable_logging_emits_to_stderr_and_honors_log_level(monkeypatch, capsys
     module.set_log_level("ERROR")
     module.enable_logging()
 
-    module.logger.warning("warning")
-    module.logger.error("error")
+    exec('logger.warning("warning")', module.__dict__)
+    exec('logger.error("error")', module.__dict__)
 
     captured = capsys.readouterr()
     assert "warning" not in captured.err
@@ -80,8 +91,8 @@ def test_enable_logging_is_idempotent(monkeypatch, capsys):
     sink_id = module._SINK_ID
 
     module.enable_logging()
-    module.logger.info("once")
+    exec('logger.info("once")', module.__dict__)
 
     captured = capsys.readouterr()
-    assert module._SINK_ID == sink_id
+    assert sink_id == module._SINK_ID
     assert captured.err.count("once") == 1

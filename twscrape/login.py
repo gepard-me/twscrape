@@ -4,9 +4,9 @@ from datetime import timedelta
 from typing import Any
 
 import pyotp
-from httpx import AsyncClient, Response
 
 from .account import Account
+from .http import HttpClient, Response
 from .imap import imap_get_email_code, imap_login
 from .logger import logger
 from .utils import utc
@@ -22,20 +22,20 @@ class LoginConfig:
 
 @dataclass
 class TaskCtx:
-    client: AsyncClient
+    client: HttpClient
     acc: Account
     cfg: LoginConfig
     prev: Any
     imap: None | imaplib.IMAP4_SSL
 
 
-async def get_guest_token(client: AsyncClient):
+async def get_guest_token(client: HttpClient):
     rep = await client.post("https://api.x.com/1.1/guest/activate.json")
     rep.raise_for_status()
     return rep.json()["guest_token"]
 
 
-async def login_initiate(client: AsyncClient) -> Response:
+async def login_initiate(client: HttpClient) -> Response:
     payload = {
         "input_flow_data": {
             "flow_context": {"debug_overrides": {}, "start_location": {"location": "unknown"}}
@@ -274,6 +274,6 @@ async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
         client.headers["x-twitter-auth-type"] = "OAuth2Session"
 
         acc.active = True
-        acc.headers = {k: v for k, v in client.headers.items()}
-        acc.cookies = {k: v for k, v in client.cookies.items()}
+        acc.headers = dict(client.headers.items())
+        acc.cookies = dict(client.cookies.items())
         return acc

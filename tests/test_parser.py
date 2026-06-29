@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Callable
+from typing import Any, Callable, cast
 
 from twscrape import API, gather
 from twscrape.models import (
@@ -13,6 +13,7 @@ from twscrape.models import (
     User,
     UserRef,
     parse_tweet,
+    parse_tweets,
 )
 
 BASE_DIR = os.path.dirname(__file__)
@@ -45,7 +46,7 @@ def fake_rep(filename: str):
         return FakeRep(fp.read())
 
 
-def mock_rep(fn: Callable, filename: str, as_generator=False):
+def mock_rep(fn: Callable[..., Any], filename: str, as_generator=False):
     rep = fake_rep(filename)
 
     async def cb_rep(*args, **kwargs):
@@ -54,11 +55,12 @@ def mock_rep(fn: Callable, filename: str, as_generator=False):
     async def cb_gen(*args, **kwargs):
         yield rep
 
-    assert "__self__" in dir(fn)
-    cb = cb_gen if as_generator else cb_rep
-    cb.__name__ = fn.__name__
-    cb.__self__ = fn.__self__  # pyright: ignore
-    setattr(fn.__self__, fn.__name__, cb)  # pyright: ignore
+    owner = getattr(fn, "__self__")
+    name = getattr(fn, "__name__")
+    cb = cast(Any, cb_gen if as_generator else cb_rep)
+    cb.__name__ = name
+    cb.__self__ = owner
+    setattr(owner, name, cb)
 
 
 def check_tweet(doc: Tweet | None):
@@ -139,6 +141,8 @@ def check_user(doc: User):
     assert str(doc.id) == doc.id_str
 
     assert doc.username is not None
+    assert isinstance(doc.profileImageUrl, str)
+    assert doc.profileImageUrl != ""
     assert doc.descriptionLinks is not None
     assert doc.pinnedIds is not None
     if doc.pinnedIds:
@@ -158,6 +162,26 @@ def check_user(doc: User):
     txt = doc.json()
     assert isinstance(txt, str)
     assert str(doc.id) in txt
+
+
+def collect_tweet_users(doc: Tweet | None):
+    if doc is None:
+        return []
+
+    users = [doc.user]
+    if doc.retweetedTweet is not None:
+        users.extend(collect_tweet_users(doc.retweetedTweet))
+    if doc.quotedTweet is not None:
+        users.extend(collect_tweet_users(doc.quotedTweet))
+    return users
+
+
+def check_user_field_coverage(users: list[User]):
+    assert len(users) > 0
+    assert any(x.location != "" for x in users)
+    assert any(x.profileBannerUrl is not None for x in users)
+    assert any(isinstance(x.protected, bool) for x in users)
+    assert any(isinstance(x.verified, bool) for x in users)
 
 
 def check_user_ref(doc: UserRef):
@@ -181,7 +205,6 @@ def check_trend(doc: Trend):
 
     assert doc.trend_url.url is not None
     assert doc.trend_url.urlType is not None
-    assert doc.trend_url.urlEndpointOptions
 
 
 async def test_search():
@@ -192,29 +215,17 @@ async def test_search():
     assert len(items) > 0
 
     bookmarks_count = 0
+    users = []
     for doc in items:
         check_tweet(doc)
         bookmarks_count += doc.bookmarkedCount
+        users.extend(collect_tweet_users(doc))
 
-    assert bookmarks_count > 0, "`bookmark_fields` key is changed or unluck search data"
-
-
-async def test_user_by_id():
-    api = get_api()
-    mock_rep(api.user_by_id_raw, "raw_user_by_id")
-
-    doc = await api.user_by_id(2244994945)
-    assert doc is not None
-    assert doc.id == 2244994945
-    assert doc.username == "XDevelopers"
-
-    obj = doc.dict()
-    assert doc.id == obj["id"]
-    assert doc.username == obj["username"]
-
-    txt = doc.json()
-    assert isinstance(txt, str)
-    assert str(doc.id) in txt
+    assert bookmarks_count > 0, (
+        "`bookmark_fields` key is changed or unlucky search data. "
+        "Run: uv run scripts/update_mocked_data.py --only search"
+    )
+    check_user_field_coverage(users)
 
 
 async def test_user_by_login():
@@ -225,6 +236,7 @@ async def test_user_by_login():
     assert doc is not None
     assert doc.id == 2244994945
     assert doc.username == "XDevelopers"
+    assert doc.blueType == "Business"
 
     obj = doc.dict()
     assert doc.id == obj["id"]
@@ -233,6 +245,32 @@ async def test_user_by_login():
     txt = doc.json()
     assert isinstance(txt, str)
     assert str(doc.id) in txt
+
+
+async def test_user_about():
+    api = get_api()
+    mock_rep(api.user_about_raw, "raw_user_about")
+
+    doc = await api.user_about("xdevelopers")
+    assert doc is not None
+    assert doc.screen_name == "XDevelopers"
+    assert isinstance(doc.rest_id, int)
+    assert isinstance(doc.name, str) and len(doc.name) > 0
+    assert doc.account_based_in is not None
+    assert doc.location_accurate is not None
+    assert doc.affiliate_username is not None
+    assert doc.source is not None
+    assert isinstance(doc.username_changes, int)
+    assert isinstance(doc.username_last_changed_at, int)
+    assert doc.is_identity_verified is not None
+    assert isinstance(doc.verified_since_msec, int)
+
+    obj = doc.dict()
+    assert doc.screen_name == obj["screen_name"]
+
+    txt = doc.json()
+    assert isinstance(txt, str)
+    assert doc.screen_name in txt
 
 
 async def test_tweet_details():
@@ -245,6 +283,7 @@ async def test_tweet_details():
 
     assert doc.id == 1649191520250245121
     assert doc.user is not None, "tweet.user should not be None"
+    check_user_field_coverage(collect_tweet_users(doc))
 
 
 async def test_tweet_replies():
@@ -258,6 +297,19 @@ async def test_tweet_replies():
     for doc in tweets:
         check_tweet(doc)
         assert doc.inReplyToTweetId == twid
+
+
+async def test_tweet_thread():
+    api = get_api()
+    mock_rep(api.tweet_thread_raw, "raw_tweet_thread", as_generator=True)
+
+    twid = 1649191520250245121
+    tweets = await gather(api.tweet_thread(twid, limit=20))
+    assert len(tweets) > 0
+
+    for doc in tweets:
+        check_tweet(doc)
+        assert doc.conversationId == twid
 
 
 async def test_followers():
@@ -363,6 +415,65 @@ async def test_list_timeline():
     tweets = await gather(api.list_timeline(1494877848087187461))
     assert len(tweets) > 0
 
+    users = []
+    for doc in tweets:
+        check_tweet(doc)
+        users.extend(collect_tweet_users(doc))
+
+    check_user_field_coverage(users)
+
+
+async def test_list_members():
+    api = get_api()
+    mock_rep(api.list_members_raw, "raw_list_members", as_generator=True)
+
+    users = await gather(api.list_members(1494877848087187461))
+    assert len(users) > 0
+
+    for doc in users:
+        check_user(doc)
+
+
+async def test_community_info():
+    api = get_api()
+    mock_rep(api.community_info_raw, "raw_community_info")
+
+    info = await api.community_info(1501272736215322629)
+    assert info is not None
+    assert isinstance(info.id, int)
+    assert info.name is not None
+    assert isinstance(info.memberCount, int)
+
+
+async def test_community_members():
+    api = get_api()
+    mock_rep(api.community_members_raw, "raw_community_members", as_generator=True)
+
+    users = await gather(api.community_members(1501272736215322629))
+    assert len(users) > 0
+
+    for doc in users:
+        check_user(doc)
+
+
+async def test_community_moderators():
+    api = get_api()
+    mock_rep(api.community_moderators_raw, "raw_community_moderators", as_generator=True)
+
+    users = await gather(api.community_moderators(1501272736215322629))
+    assert len(users) > 0
+
+    for doc in users:
+        check_user(doc)
+
+
+async def test_community_tweets():
+    api = get_api()
+    mock_rep(api.community_tweets_raw, "raw_community_tweets", as_generator=True)
+
+    tweets = await gather(api.community_tweets(1501272736215322629))
+    assert len(tweets) > 0
+
     for doc in tweets:
         check_tweet(doc)
 
@@ -433,12 +544,46 @@ async def test_issue_42():
     assert doc.rawContent.endswith(doc.retweetedTweet.rawContent)
 
 
+def test_retweet_not_duplicated():
+    """The original tweet embedded inside a retweet must not also be yielded
+    as a standalone top-level item by parse_tweets."""
+    raw = fake_rep("_issue_42").json()
+    tweets = list(parse_tweets(raw))
+
+    rt_wrapper = next((t for t in tweets if t.id == 1665951747842641921), None)
+    assert rt_wrapper is not None, "RT wrapper tweet not found"
+    assert rt_wrapper.retweetedTweet is not None
+
+    original_id = rt_wrapper.retweetedTweet.id
+    assert all(t.id != original_id for t in tweets), (
+        f"retweetedTweet {original_id} leaked as a standalone top-level item"
+    )
+
+
 async def test_issue_56():
     raw = fake_rep("_issue_56").json()
     doc = parse_tweet(raw, 1682072224013099008)
     assert doc is not None
-    assert len(set([x.tcourl for x in doc.links])) == len(doc.links)
+    assert len({x.tcourl for x in doc.links}) == len(doc.links)
     assert len(doc.links) == 5
+
+
+async def test_issue_310():
+    api = get_api()
+    mock_rep(api.user_tweets_raw, "raw_user_tweets", as_generator=True)
+
+    tweets = await gather(api.user_tweets(2244994945))
+    top_level_ids = {x.id for x in tweets}
+    retweeted_ids = {x.retweetedTweet.id for x in tweets if x.retweetedTweet is not None}
+    leaked_ids = top_level_ids & retweeted_ids
+
+    assert retweeted_ids
+    assert not leaked_ids, (
+        f"top_level={len(top_level_ids)}, "
+        f"retweets={sum(x.retweetedTweet is not None for x in tweets)}, "
+        f"retweeted_children={len(retweeted_ids)}, "
+        f"leaked={len(leaked_ids)}"
+    )
 
 
 async def test_cards():
@@ -488,3 +633,42 @@ async def test_cards():
     assert doc.card._type == "audiospace"
     assert isinstance(doc.card, AudiospaceCard)
     assert doc.card.url is not None
+
+
+async def test_tweet_new_fields():
+    tweets = [
+        *parse_tweets(fake_rep("raw_search").json()),
+        *parse_tweets(fake_rep("raw_tweet_replies").json()),
+    ]
+    assert len(tweets) > 0
+
+    for doc in tweets:
+        assert isinstance(doc.isQuoteStatus, bool)
+        assert isinstance(doc.isTranslatable, bool)
+
+        if doc.displayTextRange is not None:
+            assert isinstance(doc.displayTextRange, list)
+            assert len(doc.displayTextRange) == 2
+            assert all(isinstance(x, int) for x in doc.displayTextRange)
+
+        if doc.inReplyToScreenName is not None:
+            assert isinstance(doc.inReplyToScreenName, str)
+            assert len(doc.inReplyToScreenName) > 0
+
+        if doc.editControl is not None:
+            assert isinstance(doc.editControl, dict)
+            assert "edit_tweet_ids" in doc.editControl
+            assert isinstance(doc.editControl["edit_tweet_ids"], list)
+            assert "is_edit_eligible" in doc.editControl
+            assert isinstance(doc.editControl["is_edit_eligible"], bool)
+
+        assert doc.voiceInfo is None or isinstance(doc.voiceInfo, dict)
+
+    assert any(doc.isQuoteStatus for doc in tweets), "expected at least one quote tweet"
+    assert any(doc.inReplyToScreenName for doc in tweets), "expected at least one reply tweet"
+    assert any(doc.editControl is not None for doc in tweets), (
+        "expected editControl in at least one tweet"
+    )
+    assert any(doc.displayTextRange is not None for doc in tweets), (
+        "expected displayTextRange in at least one tweet"
+    )

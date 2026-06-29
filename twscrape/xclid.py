@@ -1,23 +1,23 @@
+import asyncio
 import base64
 import hashlib
-import json
 import math
 import random
 import re
 import time
+from urllib.parse import urljoin
 
 import bs4
-import httpx
-from fake_useragent import UserAgent
+
+from .http import HttpClient
+from .http import make_client as _make_http_client
 
 
-def _make_client() -> httpx.AsyncClient:
-    headers = {"user-agent": UserAgent().chrome}
-    return httpx.AsyncClient(headers=headers, follow_redirects=True)
+def _make_client() -> HttpClient:
+    return _make_http_client(headers={"user-agent": "@chrome"})
 
 
-async def get_tw_page_text(url: str, clt: httpx.AsyncClient | None = None):
-    clt = clt or _make_client()
+async def get_tw_page_text(url: str, clt: HttpClient):
     rep = await clt.get(url)
 
     rep.raise_for_status()
@@ -46,24 +46,45 @@ def script_url(k: str, v: str):
     return f"https://abs.twimg.com/responsive-web/client-web/{k}.{v}.js"
 
 
-def get_scripts_list(text: str):
-    scripts = text.split('e=>e+"."+')[1].split('[e]+"a.js"')[0]
-    try:
-        for k, v in json.loads(scripts).items():
-            yield script_url(k, f"{v}a")
-    except json.decoder.JSONDecodeError as e:
-        # Fix unquoted keys like: node_modules_pnpm_ws_8_18_0_node_modules_ws_browser_js
-        # Twitter started returning malformed JSON with unquoted keys
-        try:
-            fixed_scripts = re.sub(
-                r'([,\{])(\s*)([\w$]+)(\s*):(?=\s*")',
-                r'\1\2"\3"\4:',
-                scripts
-            )
-            for k, v in json.loads(fixed_scripts).items():
-                yield script_url(k, f"{v}a")
-        except Exception:
-            raise Exception("Failed to parse scripts") from e
+# Current X web build (Vite): script bundles are linked directly in the page
+# HTML under https://abs.twimg.com/x-web/.../*.js (modulepreload links + entry).
+ASSET_URL_RE = re.compile(r"https://[\w.-]+/x-web/[\w./-]+\.js")
+
+
+def get_scripts_list(text: str) -> list[str]:
+    """
+    Extract chunk script URLs from the X homepage HTML.
+
+    Current build (x-web / Vite): scripts are linked directly in the page HTML,
+    so we just collect those URLs. If none are found we fall back to the legacy
+    webpack build, which embeds two maps in the page and requires URL
+    reconstruction:
+      - Hash map  {chunk_id: "7hexchars"}            values are exactly 7 lowercase hex digits
+      - Name map  {chunk_id: "human_readable_name"}  values contain non-hex characters
+      URL format: https://abs.twimg.com/responsive-web/client-web/{name}.{hash}a.js
+    """
+    urls = list(dict.fromkeys(ASSET_URL_RE.findall(text)))
+    if urls:
+        return urls
+
+    # Legacy webpack build fallback.
+    # Hash map: values are exactly 7 lowercase hex digits (distinguishes them from name-map values)
+    hash_map = {m.group(1): m.group(2) for m in re.finditer(r'(\d+):"([0-9a-f]{7})"', text)}
+
+    if not hash_map:
+        raise Exception("Failed to parse scripts")
+
+    # Name map: values that are NOT exactly 7 hex digits (i.e. human-readable chunk names)
+    name_map: dict[str, str] = {}
+    for m in re.finditer(r'(\d+):"([^"]+)"', text):
+        val = m.group(2)
+        if not re.fullmatch(r"[0-9a-f]{7}", val):
+            name_map[m.group(1)] = val
+
+    return [
+        script_url(name_map.get(chunk_id, chunk_id), hash_val + "a")
+        for chunk_id, hash_val in hash_map.items()
+    ]
 
 
 # MARK: XClientTxId parsing
@@ -178,7 +199,7 @@ def cacl_anim_key(frames: list[float], target_time: float) -> str:
     val = Cubic(curves).get_value(target_time)
 
     color = interpolate(from_color, to_color, val)
-    color = [value if value > 0 else 0 for value in color]
+    color = [max(0, min(255, value)) for value in color]
     rotation = interpolate(from_rotation, to_rotation, val)
 
     matrix = get_rotation_matrix(rotation[0])
@@ -209,49 +230,50 @@ def parse_vk_bytes(soup: bs4.BeautifulSoup) -> list[int]:
     return list(base64.b64decode(bytes(el, "utf-8")))
 
 
-def _rextr(s: str, begin: str, end: str, pos: int) -> str | None:
-    end_idx = s.rfind(end, 0, pos)
-    if end_idx < 0:
-        return None
-    begin_idx = s.rfind(begin, 0, end_idx)
-    if begin_idx < 0:
-        return None
-    return s[begin_idx + len(begin):end_idx]
+# File holding the animation indices: legacy build linked `ondemand.s.*.js`,
+# current x-web build dynamically imports `sign.o-*.js` from a bundle chunk.
+# \b guards against substring hits like `design.o-*.js`.
+INDICES_FILE_RE = re.compile(r"(?:\.{0,2}/)?[\w./-]*?\b(?:ondemand\.s|sign\.o)[\w.-]*\.js")
 
 
-def _fextr(s: str, begin: str, end: str, pos: int = 0) -> str | None:
-    start = s.find(begin, pos)
-    if start < 0:
-        return None
-    start += len(begin)
-    stop = s.find(end, start)
-    if stop < 0:
-        return None
-    return s[start:stop]
+async def _find_indices_url(scripts: list[str], clt: HttpClient) -> str:
+    # The indices file (sign.o-*.js) is not linked in the page directly — it is
+    # dynamically imported from one of the bundle chunks. Scan chunks
+    # concurrently and resolve the first reference we find, then stop.
+    sem = asyncio.Semaphore(16)
+
+    async def fetch(url: str) -> tuple[str, str]:
+        async with sem:
+            try:
+                return url, (await clt.get(url)).text
+            except Exception:
+                return url, ""
+
+    tasks = [asyncio.create_task(fetch(u)) for u in scripts]
+    try:
+        for fut in asyncio.as_completed(tasks):
+            url, body = await fut
+            m = INDICES_FILE_RE.search(body)
+            if m:
+                return urljoin(url, m.group(0))
+    finally:
+        for t in tasks:
+            t.cancel()
+
+    raise Exception("Couldn't get XClientTxId indices script")
 
 
-async def parse_anim_idx(text: str) -> list[int]:
-    # New format: "ondemand.s" is a value in a name map, hash lives in a second
-    # map under the same key further in the HTML.
-    ondemand_pos = text.find('"ondemand.s"')
-    if ondemand_pos >= 0:
-        ondemand_key = _rextr(text, ",", ":", ondemand_pos)
-        if ondemand_key:
-            ondemand_s = _fextr(text, ondemand_key + ':"', '"', ondemand_pos)
-            if ondemand_s:
-                url = script_url("ondemand.s", f"{ondemand_s}a")
-                js_text = await get_tw_page_text(url)
-                items = [int(x.group(2)) for x in INDICES_REGEX.finditer(js_text)]
-                if items:
-                    return items
-
-    # Fallback: old format where the chunk map contains ondemand.s as a key.
+async def parse_anim_idx(text: str, clt: HttpClient) -> list[int]:
     scripts = list(get_scripts_list(text))
-    scripts = [x for x in scripts if "/ondemand.s." in x]
     if not scripts:
         raise Exception("Couldn't get XClientTxId scripts")
 
-    text = await get_tw_page_text(scripts[0])
+    # Legacy build links the indices file directly; the current x-web build
+    # hides it behind a dynamic import inside a bundle chunk.
+    direct = [x for x in scripts if INDICES_FILE_RE.search(x)]
+    url = direct[0] if direct else await _find_indices_url(scripts, clt)
+
+    text = await get_tw_page_text(url, clt)
 
     items = [int(x.group(2)) for x in INDICES_REGEX.finditer(text)]
     if not items:
@@ -273,14 +295,15 @@ def parse_anim_arr(soup: bs4.BeautifulSoup, vk_bytes: list[int]) -> list[list[fl
     return arr
 
 
-async def load_keys(soup: bs4.BeautifulSoup) -> tuple[list[int], str]:
-    anim_idx = await parse_anim_idx(str(soup))
+async def load_keys(soup: bs4.BeautifulSoup, clt: HttpClient) -> tuple[list[int], str]:
+    anim_idx = await parse_anim_idx(str(soup), clt)
     vk_bytes = parse_vk_bytes(soup)
     anim_arr = parse_anim_arr(soup, vk_bytes)
 
     frame_time = 1
     for x in anim_idx[1:]:
         frame_time *= vk_bytes[x] % 16
+    frame_time = math.floor(frame_time / 10 + 0.5) * 10  # JS Math.round to nearest 10
 
     frame_idx = vk_bytes[anim_idx[0]] % 16
     frame_row = anim_arr[frame_idx]
@@ -292,13 +315,15 @@ async def load_keys(soup: bs4.BeautifulSoup) -> tuple[list[int], str]:
 
 class XClIdGen:
     @staticmethod
-    async def create(clt: httpx.AsyncClient | None = None) -> "XClIdGen":
-        text = await get_tw_page_text("https://x.com/tesla", clt=clt)
-        soup = bs4.BeautifulSoup(text, "html.parser")
-
-        vk_bytes, anim_key = await load_keys(soup)
-        clid_gen = XClIdGen(vk_bytes, anim_key)
-        return clid_gen
+    async def create() -> "XClIdGen":
+        clt = _make_client()
+        try:
+            text = await get_tw_page_text("https://x.com/tesla", clt)
+            soup = bs4.BeautifulSoup(text, "html.parser")
+            vk_bytes, anim_key = await load_keys(soup, clt)
+            return XClIdGen(vk_bytes, anim_key)
+        finally:
+            await clt.aclose()
 
     def __init__(self, vk_bytes: list[int], anim_key: str):
         self.vk_bytes = vk_bytes
@@ -323,10 +348,13 @@ class XClIdGen:
 
 
 async def main():
-    text = await get_tw_page_text("https://x.com/elonmusk")
-    soup = bs4.BeautifulSoup(text, "html.parser")
-
-    vk_bytes, anim_key = await load_keys(soup)
+    clt = _make_client()
+    try:
+        text = await get_tw_page_text("https://x.com/elonmusk", clt)
+        soup = bs4.BeautifulSoup(text, "html.parser")
+        vk_bytes, anim_key = await load_keys(soup, clt)
+    finally:
+        await clt.aclose()
     clid_gen = XClIdGen(vk_bytes, anim_key)
 
     method = "GET"
@@ -336,6 +364,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
-
     asyncio.run(main())

@@ -27,7 +27,7 @@ def set_log_level(level: _TLOGLEVEL):
 
 
 def _filter(r):
-    return r["level"].no >= logger.level(_LOG_LEVEL).no
+    return r["name"].startswith(_LOGGER_NAME) and r["level"].no >= logger.level(_LOG_LEVEL).no
 
 
 def enable_logging():
