@@ -8,11 +8,11 @@ import sys
 import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Generator, Optional, Union
+from typing import Callable, Generator, Optional, TypeVar, Union, cast
 
 from .http import Response
 from .logger import logger
-from .utils import find_item, get_or, int_or, to_old_rep, utc
+from .utils import find_item, get_or, int_or, to_old_obj, to_old_rep, utc
 
 
 @dataclass
@@ -94,7 +94,7 @@ class AccountAbout(JSONTrait):
     verified_since_msec: int | None
 
     @staticmethod
-    def parse(obj: dict):
+    def parse(obj: dict) -> "AccountAbout":
         about = obj.get("about_profile") or {}
         core = obj.get("core") or {}
         verification = obj.get("verification_info", {}) or {}
@@ -123,7 +123,7 @@ class CommunityRule(JSONTrait):
     description: str
 
     @staticmethod
-    def parse(obj: dict):
+    def parse(obj: dict) -> "CommunityRule":
         return CommunityRule(
             id_str=str(obj.get("rest_id", obj.get("id_str", ""))),
             name=obj.get("name", ""),
@@ -145,7 +145,7 @@ class Community(JSONTrait):
     isNsfw: bool | None = None
 
     @staticmethod
-    def parse(obj: dict):
+    def parse(obj: dict) -> "Community":
         id_str = str(obj.get("rest_id") or obj.get("id_str") or "")
         topic = obj.get("primary_community_topic") or {}
         rules = [CommunityRule.parse(x) for x in obj.get("rules", [])]
@@ -212,7 +212,7 @@ class User(JSONTrait):
     # label: typing.Optional["UserLabel"] = None
 
     @staticmethod
-    def parse(obj: dict, res=None):
+    def parse(obj: dict, res=None) -> "User":
         return User(
             id=int(obj["id_str"]),
             id_str=obj["id_str"],
@@ -288,8 +288,8 @@ class Tweet(JSONTrait):
     # vibe: Optional["Vibe"] = None
 
     @staticmethod
-    def parse(obj: dict, res: dict):
-        tw_usr = User.parse(res["users"][obj["user_id_str"]])
+    def parse(obj: dict, res: dict) -> "Tweet":
+        tw_usr = User.parse(_get_tweet_user_obj(obj, res))
 
         rt_id_path = [
             "retweeted_status_id_str",
@@ -558,7 +558,7 @@ class Trend(JSONTrait):
     _type: str = "timelinetrend"
 
     @staticmethod
-    def parse(obj: dict, res=None):
+    def parse(obj: dict, res=None) -> "Trend":
         grouped_trends = [GroupedTrend.parse(x) for x in obj.get("grouped_trends", [])]
         return Trend(
             id=f"trend-{obj['name']}",
@@ -577,10 +577,10 @@ def _parse_card_get_bool(values: list[dict], key: str):
     return False
 
 
-def _parse_card_get_str(values: list[dict], key: str, defaultVal=None) -> str | None:
+def _parse_card_get_str(values: list[dict], key: str, defaultVal: str | None = None) -> str | None:
     for x in values:
         if x["key"] == key:
-            return x["value"]["string_value"]
+            return cast(str, x["value"]["string_value"])
     return defaultVal
 
 
@@ -672,7 +672,7 @@ def _parse_card(obj: dict, url: str):
             video=video,
         )
 
-    if re.match(r"poll\d+choice_text_only", name):
+    if re.match(r"(?:\d+:)?poll(?:\d+choice_text_only|_choice_images)", name):
         val = _parse_card_prepare_values(obj)
 
         options = []
@@ -735,6 +735,24 @@ def _get_reply_user(tw_obj: dict, res: dict):
 
     # todo: user not found in reply (probably deleted or hidden)
     return None
+
+
+def _get_tweet_user_obj(tw_obj: dict, res: dict) -> dict:
+    """Return the referenced user or an author embedded in the tweet."""
+    user_id = tw_obj.get("user_id_str")
+    users = res.get("users", {})
+    if user_id is not None and user_id in users:
+        return users[user_id]
+
+    for path in ("core.user_results.result", "author_results.result"):
+        user_obj = get_or(tw_obj, path)
+        if not isinstance(user_obj, dict) or user_obj.get("__typename") == "UserUnavailable":
+            continue
+        if "legacy" in user_obj and "rest_id" in user_obj:
+            return to_old_obj(user_obj)
+        return user_obj
+
+    raise KeyError(f"user {user_id} not found in response payload")
 
 
 def _get_source_url(tw_obj: dict):
@@ -809,15 +827,16 @@ def _write_dump(kind: str, e: Exception, x: dict, obj: dict):
     logger.error(f"Failed to parse response of {kind}, writing dump to {dumpfile}")
 
 
-def _parse_items(rep: Response, kind: str, limit: int = -1):
-    if kind == "user":
-        Cls, key = User, "users"
-    elif kind == "tweet":
-        Cls, key = Tweet, "tweets"
-    elif kind == "trends":
-        Cls, key = Trend, "trends"
-    else:
-        raise ValueError(f"Invalid kind: {kind}")
+ParsedItem = TypeVar("ParsedItem", Tweet, User, Trend)
+
+
+def _parse_items(
+    rep: Response,
+    kind: str,
+    parser: Callable[[dict, dict], ParsedItem],
+    limit: int = -1,
+) -> Generator[ParsedItem, None, None]:
+    key = kind if kind == "trends" else f"{kind}s"
 
     # check for dict, because Response can be mocked in tests with different type
     res = rep if isinstance(rep, dict) else rep.json()
@@ -835,7 +854,7 @@ def _parse_items(rep: Response, kind: str, limit: int = -1):
             pass
 
         try:
-            tmp = Cls.parse(x, obj)
+            tmp = parser(x, obj)
             if tmp.id not in ids:
                 ids.add(tmp.id)
                 yield tmp
@@ -906,12 +925,12 @@ def parse_community(rep: Response | dict) -> Community | None:
 
 
 def parse_tweets(rep: Response, limit: int = -1) -> Generator[Tweet, None, None]:
-    return _parse_items(rep, "tweet", limit)
+    return _parse_items(rep, "tweet", Tweet.parse, limit)
 
 
 def parse_users(rep: Response, limit: int = -1) -> Generator[User, None, None]:
-    return _parse_items(rep, "user", limit)
+    return _parse_items(rep, "user", User.parse, limit)
 
 
 def parse_trends(rep: Response, limit: int = -1) -> Generator[Trend, None, None]:
-    return _parse_items(rep, kind="trends", limit=limit)
+    return _parse_items(rep, "trends", Trend.parse, limit)

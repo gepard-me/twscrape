@@ -43,7 +43,13 @@ async def client_fixture(pool_mock: AccountsPool, monkeypatch):
     pool_mock._order_by = "username"
 
     for x in range(1, 3):
-        await pool_mock.add_account(f"user{x}", f"pass{x}", f"email{x}", f"email_pass{x}")
+        await pool_mock.add_account(
+            f"user{x}",
+            f"pass{x}",
+            f"email{x}",
+            f"email_pass{x}",
+            cookies=f"auth_token=token{x}; ct0=csrf{x}",
+        )
         await pool_mock.set_active(f"user{x}", True)
 
     client = QueueClient(pool_mock, "SearchTimeline")
@@ -52,7 +58,13 @@ async def client_fixture(pool_mock: AccountsPool, monkeypatch):
 
 @pytest.fixture
 async def api_mock(pool_mock: AccountsPool):
-    await pool_mock.add_account("user1", "pass1", "email1", "email_pass1")
+    await pool_mock.add_account(
+        "user1",
+        "pass1",
+        "email1",
+        "email_pass1",
+        cookies="auth_token=token1; ct0=csrf1",
+    )
     await pool_mock.set_active("user1", True)
 
     api = API(pool_mock)

@@ -1,6 +1,7 @@
 import pytest
 
 from twscrape.accounts_pool import AccountsPool, NoAccountError
+from twscrape.api import API
 from twscrape.utils import utc
 
 
@@ -12,6 +13,8 @@ async def test_add_accounts(pool_mock: AccountsPool):
     assert acc.password == "pass1"
     assert acc.email == "email1"
     assert acc.email_password == "email_pass1"
+    acc.email_password = "_"
+    assert acc.login_method == "password"
 
     # should not add account with same username
     await pool_mock.add_account("user1", "pass2", "email2", "email_pass2")
@@ -43,24 +46,43 @@ async def test_add_account_cookies(pool_mock: AccountsPool):
     acc = await pool_mock.get("user1")
 
     assert acc.active is True
+    assert acc.has_session is True
+    assert acc.login_method == "cookies"
 
 
-async def test_add_account_cookies_without_ct0(pool_mock: AccountsPool):
-    await pool_mock.add_account_cookies("user1", "auth_token=token")
-    acc = await pool_mock.get("user1")
-
-    assert acc.active is False
+@pytest.mark.parametrize(
+    "cookies",
+    ["auth_token=token", "ct0=csrf", "other=value"],
+)
+async def test_add_account_cookies_requires_full_session(pool_mock: AccountsPool, cookies: str):
+    with pytest.raises(ValueError):
+        await pool_mock.add_account_cookies("user1", cookies)
+    assert await pool_mock.get_account("user1") is None
 
 
 async def test_add_account_cookies_existing(pool_mock: AccountsPool):
-    await pool_mock.add_account_cookies("user1", "auth_token=token; ct0=csrf")
+    await pool_mock.add_account(
+        "user1",
+        "pass",
+        "email",
+        "email-pass",
+        proxy="http://proxy.test",
+        mfa_code="mfa-secret",
+        cookies="auth_token=token; ct0=csrf",
+    )
     acc = await pool_mock.get("user1")
+    acc.stats = {"SearchTimeline": 3}
+    await pool_mock.save(acc)
 
-    await pool_mock.add_account_cookies("user1", "auth_token=other")
+    await pool_mock.add_account_cookies("user1", "auth_token=other; ct0=other-csrf")
     same = await pool_mock.get("user1")
 
-    assert same.cookies == acc.cookies
+    assert same.cookies == {"auth_token": "other", "ct0": "other-csrf"}
     assert same.active is True
+    assert same.login_method == "password"
+    assert same.password == "pass"
+    assert same.proxy == acc.proxy
+    assert same.stats == acc.stats
 
 
 async def test_get_all(pool_mock: AccountsPool):
@@ -178,6 +200,39 @@ async def test_delete_accounts(pool_mock: AccountsPool):
     assert len(await pool_mock.get_all()) == 0
 
 
+async def test_username_lists_are_parameterized(pool_mock: AccountsPool, monkeypatch):
+    username = 'user"quoted'
+    await pool_mock.add_account(username, "pass", "email", "ep")
+
+    async def fake_login(account):
+        return True
+
+    monkeypatch.setattr(pool_mock, "login", fake_login)
+    assert await pool_mock.login_all([username]) == {"total": 1, "success": 1, "failed": 0}
+
+    await pool_mock.relogin(username)
+    assert (await pool_mock.get(username)).active is False
+
+    await pool_mock.delete_accounts([username])
+    assert await pool_mock.get_all() == []
+
+
+async def test_login_all_empty_username_list_is_noop(pool_mock: AccountsPool):
+    assert await pool_mock.login_all([]) == {"total": 0, "success": 0, "failed": 0}
+
+
+async def test_relogin_skips_cookie_accounts(pool_mock: AccountsPool, monkeypatch):
+    await pool_mock.add_account_cookies("user1", "auth_token=token; ct0=csrf")
+
+    async def fail_if_called(account):
+        pytest.fail("cookie account entered password login")
+
+    monkeypatch.setattr(pool_mock, "login", fail_if_called)
+    await pool_mock.relogin("user1")
+
+    assert (await pool_mock.get("user1")).active is True
+
+
 async def test_delete_inactive(pool_mock: AccountsPool):
     await pool_mock.add_account("user1", "pass1", "email1", "ep1")
     await pool_mock.add_account("user2", "pass2", "email2", "ep2")
@@ -238,6 +293,58 @@ async def test_get_for_queue_or_wait_raises_via_env(pool_mock: AccountsPool, mon
     monkeypatch.setenv("TWS_RAISE_WHEN_NO_ACCOUNT", "1")
     with pytest.raises(NoAccountError):
         await pool_mock.get_for_queue_or_wait("TestQueue")
+
+
+async def test_get_for_queue_or_wait_waits_for_locked_account(pool_mock: AccountsPool, monkeypatch):
+    queue = "TestQueue"
+    pool = AccountsPool(pool_mock._db_file, wait_timeout=1, wait_interval=0.1)
+    await pool.add_account("user1", "pass1", "email1", "ep1")
+    await pool.set_active("user1", True)
+    await pool.get_for_queue(queue)
+
+    intervals = []
+
+    async def release_account(interval):
+        intervals.append(interval)
+        await pool.unlock("user1", queue)
+
+    monkeypatch.setattr("twscrape.accounts_pool.asyncio.sleep", release_account)
+
+    account = await pool.get_for_queue_or_wait(queue)
+
+    assert account is not None
+    assert account.username == "user1"
+    assert intervals == [0.1]
+
+
+async def test_get_for_queue_or_wait_returns_none_when_timeout_is_zero(pool_mock: AccountsPool):
+    queue = "TestQueue"
+    pool = AccountsPool(pool_mock._db_file, wait_timeout=0)
+    await pool.add_account("user1", "pass1", "email1", "ep1")
+    await pool.set_active("user1", True)
+    await pool.get_for_queue(queue)
+
+    assert await pool.get_for_queue_or_wait(queue) is None
+
+
+async def test_get_for_queue_or_wait_does_not_wait_without_active_accounts(
+    pool_mock: AccountsPool, monkeypatch
+):
+    pool = AccountsPool(pool_mock._db_file, wait_timeout=1)
+
+    async def fail_if_called(_):
+        pytest.fail("should not wait when no accounts are active")
+
+    monkeypatch.setattr("twscrape.accounts_pool.asyncio.sleep", fail_if_called)
+
+    assert await pool.get_for_queue_or_wait("TestQueue") is None
+
+
+def test_api_passes_wait_config_to_new_pool(tmp_path):
+    api = API(str(tmp_path / "test.db"), wait_timeout=1, wait_interval=0.1)
+
+    assert api.pool._wait_timeout == 1
+    assert api.pool._wait_interval == 0.1
 
 
 async def test_accounts_info_active_first(pool_mock: AccountsPool):

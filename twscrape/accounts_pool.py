@@ -1,10 +1,11 @@
 import asyncio
+import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import TypedDict
 
-from .account import Account
+from .account import Account, has_required_cookies
 from .db import execute, fetchall, fetchone
 from .http import HttpStatusError
 from .logger import logger
@@ -18,6 +19,7 @@ class NoAccountError(Exception):
 
 class AccountInfo(TypedDict):
     username: str
+    login_method: str
     logged_in: bool
     active: bool
     last_used: datetime | None
@@ -39,10 +41,25 @@ class AccountsPool:
         db_file="accounts.db",
         login_config: LoginConfig | None = None,
         raise_when_no_account=False,
+        wait_timeout: float | None = None,
+        wait_interval: float = 5.0,
     ):
         self._db_file = db_file
         self._login_config = login_config or LoginConfig()
         self._raise_when_no_account = raise_when_no_account
+        # When every active account is momentarily locked (in-use or rate-limited),
+        # get_for_queue_or_wait polls for up to wait_timeout seconds (every
+        # wait_interval) before giving up. This lets a brief in-use lock resolve into
+        # a successful acquisition instead of an instant failure, while a real
+        # rate-limit is not waited out indefinitely. None keeps the legacy behaviour
+        # (raise immediately if raise_when_no_account, otherwise block forever).
+        self._wait_timeout = wait_timeout
+        self._wait_interval = wait_interval
+
+    @staticmethod
+    def _usernames_where(usernames: list[str]) -> tuple[str, dict[str, str]]:
+        params = {f"username_{i}": x for i, x in enumerate(dict.fromkeys(usernames))}
+        return ",".join(f":{x}" for x in params), params
 
     async def load_from_file(self, filepath: str, line_format: str):
         line_delim = guess_delim(line_format)
@@ -101,31 +118,38 @@ class AccountsPool:
             mfa_code=mfa_code,
         )
 
-        if "ct0" in account.cookies:
+        if has_required_cookies(account.cookies):
             account.active = True
 
         await self.save(account)
         logger.info(f"Account {username} added successfully (active={account.active})")
 
     async def add_account_cookies(self, username: str, cookies: str):
-        existing = await self.get_account(username)
-        if existing is not None:
-            logger.warning(f"Account {username} already exists (active={existing.active})")
-            return
+        parsed = parse_cookies(cookies)
+        if not has_required_cookies(parsed):
+            raise ValueError("Cookies must include auth_token and ct0")
 
-        await self.add_account(
-            username=username, password="_", email="_", email_password="_", cookies=cookies
-        )
+        qs = """
+        INSERT INTO accounts (username, password, email, email_password, user_agent, active, cookies)
+        VALUES (:username, '_', '_', '_', '@chrome', true, :cookies)
+        ON CONFLICT(username) DO UPDATE SET
+            cookies = excluded.cookies,
+            headers = '{}',
+            active = true,
+            error_msg = NULL
+        """
+        await execute(self._db_file, qs, {"username": username, "cookies": json.dumps(parsed)})
+        logger.info(f"Cookies for account {username} updated successfully")
 
     async def delete_accounts(self, usernames: str | list[str]):
         usernames = usernames if isinstance(usernames, list) else [usernames]
-        usernames = list(set(usernames))
         if not usernames:
             logger.warning("No usernames provided")
             return
 
-        qs = f"""DELETE FROM accounts WHERE username IN ({",".join([f'"{x}"' for x in usernames])})"""
-        await execute(self._db_file, qs)
+        placeholders, params = self._usernames_where(usernames)
+        qs = f"DELETE FROM accounts WHERE username IN ({placeholders})"
+        await execute(self._db_file, qs, params)
 
     async def delete_inactive(self):
         qs = "DELETE FROM accounts WHERE active = false"
@@ -175,15 +199,23 @@ class AccountsPool:
         finally:
             await self.save(account)
 
+    # Cookie accounts use password="_" and get their session through add_cookie.
+    # Password accounts get their session through login/login_all.
+    # Relogin resets only password accounts; cookie accounts wait for another add_cookie.
     async def login_all(self, usernames: list[str] | None = None):
+        if usernames is not None and not usernames:
+            return {"total": 0, "success": 0, "failed": 0}
+
+        params = None
         if usernames is None:
             qs = "SELECT * FROM accounts WHERE active = false AND error_msg IS NULL"
         else:
-            us = ",".join([f'"{x}"' for x in usernames])
-            qs = f"SELECT * FROM accounts WHERE username IN ({us})"
+            placeholders, params = self._usernames_where(usernames)
+            qs = f"SELECT * FROM accounts WHERE username IN ({placeholders})"
 
-        rs = await fetchall(self._db_file, qs)
+        rs = await fetchall(self._db_file, qs, params)
         accounts = [Account.from_rs(rs) for rs in rs]
+        accounts = [x for x in accounts if x.login_method == "password"]
         # await asyncio.gather(*[login(x) for x in self.accounts])
 
         counter = {"total": len(accounts), "success": 0, "failed": 0}
@@ -195,11 +227,11 @@ class AccountsPool:
 
     async def relogin(self, usernames: str | list[str]):
         usernames = usernames if isinstance(usernames, list) else [usernames]
-        usernames = list(set(usernames))
         if not usernames:
             logger.warning("No usernames provided")
             return
 
+        placeholders, params = self._usernames_where(usernames)
         qs = f"""
         UPDATE accounts SET
             active = false,
@@ -209,10 +241,10 @@ class AccountsPool:
             headers = json_object(),
             cookies = json_object(),
             user_agent = "@chrome"
-        WHERE username IN ({",".join([f'"{x}"' for x in usernames])})
+        WHERE username IN ({placeholders}) AND password != '_'
         """
 
-        await execute(self._db_file, qs)
+        await execute(self._db_file, qs, params)
         await self.login_all(usernames)
 
     async def relogin_failed(self):
@@ -248,7 +280,7 @@ class AccountsPool:
         """
         await execute(self._db_file, qs, {"username": username})
 
-    async def _get_and_lock(self, queue: str, condition: str):
+    async def _get_and_lock(self, queue: str, condition: str) -> Account | None:
         # if space in condition, it's a subquery, otherwise it's username
         condition = f"({condition})" if " " in condition else f"'{condition}'"
 
@@ -277,7 +309,7 @@ class AccountsPool:
 
         return Account.from_rs(rs) if rs else None
 
-    async def get_for_queue(self, queue: str):
+    async def get_for_queue(self, queue: str) -> Account | None:
         q = f"""
         SELECT username FROM accounts
         WHERE active = true AND (
@@ -292,30 +324,45 @@ class AccountsPool:
         return await self._get_and_lock(queue, q)
 
     async def get_for_queue_or_wait(self, queue: str) -> Account | None:
+        start = utc.now()
         msg_shown = False
         while True:
             account = await self.get_for_queue(queue)
-            if not account:
-                if self._raise_when_no_account or get_env_bool("TWS_RAISE_WHEN_NO_ACCOUNT"):
-                    raise NoAccountError(f"No account available for queue {queue}")
-
-                if not msg_shown:
-                    nat = await self.next_available_at(queue)
-                    if not nat:
-                        logger.warning("No active accounts. Stopping...")
-                        return None
-
-                    msg = f'No account available for queue "{queue}". Next available at {nat}'
-                    logger.info(msg)
-                    msg_shown = True
-
-                await asyncio.sleep(5)
-                continue
-            else:
+            if account is not None:
                 if msg_shown:
                     logger.info(f"Continuing with account {account.username} on queue {queue}")
+                return account
 
-            return account
+            raise_no_account = self._raise_when_no_account or get_env_bool(
+                "TWS_RAISE_WHEN_NO_ACCOUNT"
+            )
+
+            # next_available_at returns None only when no active account exists at all,
+            # in which case waiting is futile. A timestamp means active accounts exist
+            # but are all locked right now (in-use or rate-limited).
+            nat = await self.next_available_at(queue)
+            no_active = not nat
+
+            # Give up (raise / stop) when: no active account exists, the caller opted
+            # out of waiting (wait_timeout is None), or the wait budget is exhausted.
+            elapsed = (utc.now() - start).total_seconds()
+            give_up = no_active or self._wait_timeout is None or elapsed >= self._wait_timeout
+            if give_up:
+                if raise_no_account:
+                    raise NoAccountError(f"No account available for queue {queue}")
+                if no_active:
+                    logger.warning("No active accounts. Stopping...")
+                    return None
+                if self._wait_timeout is not None:
+                    return None
+                # wait_timeout is None and not raising: fall through to the legacy
+                # unbounded wait below.
+
+            if not msg_shown:
+                logger.info(f'No account available for queue "{queue}". Next available at {nat}')
+                msg_shown = True
+
+            await asyncio.sleep(self._wait_interval)
 
     async def next_available_at(self, queue: str):
         qs = f"""
@@ -373,7 +420,8 @@ class AccountsPool:
         for x in accounts:
             item: AccountInfo = {
                 "username": x.username,
-                "logged_in": (x.headers or {}).get("authorization", "") != "",
+                "logged_in": x.has_session,
+                "login_method": x.login_method,
                 "active": x.active,
                 "last_used": x.last_used,
                 "total_req": sum(x.stats.values()),
